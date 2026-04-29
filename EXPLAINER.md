@@ -1,135 +1,234 @@
 # EXPLAINER.md
 
-## 1. Ledger Design
+## 1. System Overview
 
-Balance is NOT stored directly.
+This system implements a payout engine where:
 
-It is derived using:
-
-```sql
-SELECT COALESCE(SUM(
-  CASE 
-    WHEN entry_type = 'credit' THEN amount_paise
-    ELSE -amount_paise
-  END
-), 0)
-FROM ledger_entry
-WHERE merchant_id = %s;
-```
-
-### Why this design?
-
-* Prevents inconsistency
-* Fully auditable
-* Supports reconciliation
-* Avoids race conditions
+* Merchants receive credits (international payments)
+* Merchants request payouts (bank transfers)
+* System ensures correctness under concurrency and retries
 
 ---
 
-## 2. Concurrency Handling (Critical)
+## 2. Ledger-Based Accounting (Core Design)
 
-Code:
+Balance is NOT stored as a column.
+
+Instead, it is derived from ledger entries:
+
+* credit → adds balance
+* debit → reduces balance
+
+### Why this approach?
+
+* Prevents data inconsistency
+* Fully auditable (every transaction stored)
+* Easy rollback via compensating entries
+* Eliminates race conditions from direct balance updates
+
+### Tradeoff
+
+* Slightly slower reads (aggregation)
+* Solved using DB aggregation + indexing
+
+---
+
+## 3. Balance Calculation
+
+Balance is computed using DB aggregation:
+
+```sql
+SUM(CASE 
+  WHEN entry_type='credit' THEN amount_paise
+  ELSE -amount_paise
+END)
+```
+
+### Why DB-level aggregation?
+
+* Atomic and consistent
+* Avoids stale application-level calculations
+* Scales with DB optimization
+
+---
+
+## 4. Concurrency Handling (Critical Section)
+
+When creating a payout:
 
 ```python
 with transaction.atomic():
     merchant = Merchant.objects.select_for_update().get(id=merchant_id)
 ```
 
-### Explanation:
+### Why this works
 
-* Uses DB-level row locking
-* Prevents simultaneous balance deductions
-* Ensures only one payout succeeds when balance is insufficient
+* Locks the merchant row
+* Prevents concurrent updates
+* Ensures only one payout can deduct balance at a time
+
+### Example scenario
+
+Two requests with ₹100 balance:
+
+* Request A → locks row → succeeds
+* Request B → waits → fails if balance insufficient
 
 ---
 
-## 3. Idempotency
+## 5. Idempotency (Production Requirement)
 
-Stored in `IdempotencyKey` table.
+Each payout request uses:
 
-Flow:
+```
+Idempotency-Key header
+```
+
+### Flow
 
 1. Check if key exists
 2. If yes → return stored response
-3. If no → process request + save response
+3. If no → process + store result
 
-### Edge case handled:
+### Why this is important
 
-If two requests come simultaneously:
-
-* One succeeds
-* Second reads stored response
-
----
-
-## 4. State Machine
-
-Valid transitions:
-
-* pending → processing → completed
-* pending → processing → failed
-
-Invalid transitions are blocked in model/service layer.
-
-Example:
-
-```python
-if payout.status == "completed":
-    raise Exception("Invalid transition")
-```
+* Prevents duplicate payouts
+* Handles client retries safely
+* Guarantees exactly-once semantics
 
 ---
 
-## 5. Retry Logic
+## 6. State Machine Design
 
-* Processing > 30 seconds → retry
-* Exponential backoff
+Payout states:
+
+* pending
+* processing
+* completed
+* failed
+
+### Valid transitions
+
+* pending → processing
+* processing → completed
+* processing → failed
+
+Invalid transitions are blocked.
+
+### Why this matters
+
+* Prevents inconsistent states
+* Makes system predictable
+* Enables retry logic safely
+
+---
+
+## 7. Retry & Failure Handling
+
+If payout processing fails:
+
+* Retry with exponential backoff
 * Max retries = 3
-* After that → mark failed + refund
+* If still failing:
+
+  * mark payout as failed
+  * reverse ledger entry (refund)
+
+### Why this design
+
+* Ensures money is never lost
+* Handles transient failures (network/bank API)
 
 ---
 
-## 6. Money Integrity
+## 8. Money Precision
 
-* Stored as BigInteger (paise)
-* No float/decimal rounding errors
-* All updates done via DB transactions
+* All amounts stored as **paise (integer)**
+* No floating point operations
+
+### Why
+
+* Avoids rounding errors
+* Industry-standard approach for financial systems
 
 ---
 
-## 7. AI Audit (Important)
+## 9. Data Integrity Guarantees
 
-### ❌ AI-generated issue:
+System guarantees:
 
-Initial code used:
+* No double spending
+* No negative balance (checked before debit)
+* All operations wrapped in DB transactions
 
-```python
-balance = sum(entries)
-```
+---
 
-Problem:
+## 10. Scalability Considerations
 
-* Not atomic
-* Race condition risk
+* DB row-level locking ensures correctness
+* Can be extended with:
 
-### ✅ Fix:
+  * sharding merchants
+  * read replicas for balance queries
+  * async payout processing (Celery)
 
-Replaced with DB aggregation:
+---
 
-```python
-LedgerEntry.objects.aggregate(...)
-```
+## 11. AI Usage & Corrections
+
+AI was used for scaffolding but had issues:
+
+### Issue:
+
+Used application-level sum → race condition
+
+### Fix:
+
+Moved to DB-level aggregation + locking
 
 ### Result:
 
-* Safe
-* Accurate
-* Scalable
+Production-safe logic
 
 ---
 
-## 8. Deployment Notes
+## 12. Deployment
 
 * Hosted on Render
-* PostgreSQL + Redis configured
-* Migrations handled at startup
+* PostgreSQL for persistence
+* Redis for background jobs
+* Gunicorn for production serving
+
+---
+
+## 13. Key Design Decisions Summary
+
+| Problem             | Solution         |
+| ------------------- | ---------------- |
+| Double spending     | Row locking      |
+| Duplicate API calls | Idempotency keys |
+| Money accuracy      | Integer (paise)  |
+| Auditability        | Ledger system    |
+| Failures            | Retry + refund   |
+
+---
+
+## 14. What I Would Improve Next
+
+* Add API authentication
+* Add rate limiting
+* Add monitoring (Prometheus)
+* Add distributed locking for multi-node scaling
+* Introduce event-driven architecture (Kafka)
+
+---
+
+## Conclusion
+
+This system prioritizes:
+
+* correctness over convenience
+* consistency over speed
+* auditability over simplicity
+
+It is designed to behave predictably under real-world failures and concurrency.
